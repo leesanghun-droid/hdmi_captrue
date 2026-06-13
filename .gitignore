@@ -12,4 +12,5 @@ DeckLinkAPI_i.c
 
 # Logs and captures
 *.log
+*.err
 *.png

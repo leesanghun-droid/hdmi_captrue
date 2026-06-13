@@ -12,5 +12,5 @@ if errorlevel 1 ( echo MIDL FAILED & exit /b 1 )
 
 echo === CL: compiling DeckLinkPreview.exe ===
 cl /nologo /EHsc /std:c++17 /O2 /W3 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 main.cpp DeckLinkAPI_i.c /Fe:DeckLinkPreview.exe ^
-   /link opengl32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib
+   /link opengl32.lib ole32.lib oleaut32.lib user32.lib gdi32.lib ws2_32.lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
 echo EXITCODE=%ERRORLEVEL%
