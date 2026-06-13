@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.tlb
+
+# Generated from the Blackmagic DeckLink SDK IDL (run build.bat to regenerate)
+DeckLinkAPI_h.h
+DeckLinkAPI_i.c
+
+# Logs and captures
+*.log
+*.png
