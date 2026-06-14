@@ -9,11 +9,18 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
+#include <string>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #include <gl/gl.h>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+
+#pragma comment(lib, "iphlpapi.lib")
 
 #include "DeckLinkAPI_h.h"
 
@@ -46,6 +53,10 @@ std::atomic<unsigned long long> g_frameCount{0};
 wchar_t g_modeName[256] = L"(detecting...)";
 long    g_modeW = 0, g_modeH = 0;
 
+// Transient status shown in the title bar (e.g. drag-and-drop file transfer).
+wchar_t   g_drop[200]  = L"";
+ULONGLONG g_dropExpire = 0;
+
 void Log(const char* msg) { printf("%s\n", msg); fflush(stdout); }
 
 // ---------------------------------------------------------------------------
@@ -66,15 +77,32 @@ uint16_t    g_lastY    = 16384;
 char        g_kvmTarget[64] = "192.168.0.8";
 int         g_kvmPort  = 50000;
 
+// Guards g_kvmTarget / g_kvmPort / g_kvmAddr (touched by the UI and ping threads).
+CRITICAL_SECTION  g_kvmLock;
+// Latest ping result to the KVM target: -2 = unknown/measuring, -1 = no reply,
+// >=0 = round-trip latency in ms.
+std::atomic<int>  g_pingMs{-2};
+HANDLE            g_pingThread = nullptr;
+std::atomic<bool> g_pingRun{false};
+
+// Recompute the destination sockaddr from the current target IP / port.
+void ApplyKvmTarget()
+{
+    EnterCriticalSection(&g_kvmLock);
+    g_kvmAddr.sin_family = AF_INET;
+    g_kvmAddr.sin_port   = htons((u_short)g_kvmPort);
+    inet_pton(AF_INET, g_kvmTarget, &g_kvmAddr.sin_addr);
+    LeaveCriticalSection(&g_kvmLock);
+    g_pingMs.store(-2);   // force a fresh measurement against the new target
+}
+
 bool KvmInit()
 {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return false;
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) return false;
-    g_kvmAddr.sin_family = AF_INET;
-    g_kvmAddr.sin_port   = htons((u_short)g_kvmPort);
-    inet_pton(AF_INET, g_kvmTarget, &g_kvmAddr.sin_addr);
+    ApplyKvmTarget();
     return true;
 }
 
@@ -207,7 +235,9 @@ bool MapMouse(HWND hwnd, int mx, int my, uint16_t* ox, uint16_t* oy)
 {
     RECT rc; GetClientRect(hwnd, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    const long w = g_modeW, h = g_modeH;
+    // Mouse mapping is pinned to a 1920x1080 (16:9) target so absolute
+    // positioning stays correct regardless of the detected capture mode.
+    const long w = 1920, h = 1080;
     if (w <= 0 || h <= 0 || cw <= 0 || ch <= 0) return false;
     const double srcA = (double)w / (double)h;
     const double dstA = (double)cw / (double)ch;
@@ -480,12 +510,326 @@ void ToggleScreen(HWND hwnd)
     else              ToggleFullscreen(hwnd);
 }
 
+// ---------------------------------------------------------------------------
+// KVM target options: right-click the title bar to edit the IP / port and to
+// watch a live ping (reachability) indicator.
+// ---------------------------------------------------------------------------
+
+// Background worker: pings the current KVM target about once a second and
+// publishes the round-trip latency in g_pingMs (-2 = measuring, -1 = no reply).
+DWORD WINAPI PingThreadProc(LPVOID)
+{
+    HANDLE icmp = IcmpCreateFile();
+    while (g_pingRun.load())
+    {
+        char ip[64];
+        EnterCriticalSection(&g_kvmLock);
+        strncpy_s(ip, g_kvmTarget, _TRUNCATE);
+        LeaveCriticalSection(&g_kvmLock);
+
+        IN_ADDR dst{};
+        if (icmp != INVALID_HANDLE_VALUE && inet_pton(AF_INET, ip, &dst) == 1)
+        {
+            char  payload[32] = "decklink-kvm-ping";
+            char  reply[sizeof(ICMP_ECHO_REPLY) + sizeof(payload) + 8];
+            DWORD n = IcmpSendEcho(icmp, dst.S_un.S_addr, payload, sizeof(payload),
+                                   nullptr, reply, sizeof(reply), 800);
+            if (n > 0)
+            {
+                ICMP_ECHO_REPLY* er = reinterpret_cast<ICMP_ECHO_REPLY*>(reply);
+                g_pingMs.store(er->Status == IP_SUCCESS ? (int)er->RoundTripTime : -1);
+            }
+            else g_pingMs.store(-1);
+        }
+        else g_pingMs.store(-1);
+
+        for (int i = 0; i < 10 && g_pingRun.load(); ++i) Sleep(100);
+    }
+    if (icmp != INVALID_HANDLE_VALUE) IcmpCloseHandle(icmp);
+    return 0;
+}
+
+// Build a short, human-readable ping status string and its display colour.
+void PingStatus(wchar_t* buf, size_t n, COLORREF* col)
+{
+    int ms = g_pingMs.load();
+    if (ms == -2)      { wcscpy_s(buf, n, L"\uCE21\uC815 \uC911...");                 if (col) *col = RGB(110,110,110); } // 측정 중...
+    else if (ms < 0)   { wcscpy_s(buf, n, L"\uC751\uB2F5 \uC5C6\uC74C (timeout)");      if (col) *col = RGB(200, 40, 40); } // 응답 없음 (timeout)
+    else               { swprintf_s(buf, n, L"\uC815\uC0C1  (%d ms)", ms);              if (col) *col = RGB(20,140, 40); } // 정상 (n ms)
+}
+
+namespace optdlg {
+    enum { IDC_IP = 101, IDC_PORT = 102, IDC_PINGTXT = 103, IDB_PINGNOW = 106 };
+    bool  g_done = false;
+    HFONT g_font = nullptr;
+
+    // Read + validate the edit fields, then apply them as the new KVM target.
+    bool Apply(HWND dlg)
+    {
+        char ip[64] = {0};
+        GetDlgItemTextA(dlg, IDC_IP, ip, sizeof(ip));
+        IN_ADDR t{};
+        if (inet_pton(AF_INET, ip, &t) != 1)
+        {
+            MessageBoxW(dlg, L"IP \uC8FC\uC18C \uD615\uC2DD\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.",
+                        L"KVM \uC124\uC815", MB_ICONWARNING | MB_OK);
+            return false;
+        }
+        char ps[16] = {0};
+        GetDlgItemTextA(dlg, IDC_PORT, ps, sizeof(ps));
+        int port = atoi(ps);
+        if (port < 1 || port > 65535)
+        {
+            MessageBoxW(dlg, L"\uD3EC\uD2B8\uB294 1 ~ 65535 \uBC94\uC704\uC5EC\uC57C \uD569\uB2C8\uB2E4.",
+                        L"KVM \uC124\uC815", MB_ICONWARNING | MB_OK);
+            return false;
+        }
+        EnterCriticalSection(&g_kvmLock);
+        strncpy_s(g_kvmTarget, ip, _TRUNCATE);
+        g_kvmPort = port;
+        LeaveCriticalSection(&g_kvmLock);
+        ApplyKvmTarget();
+        return true;
+    }
+
+    LRESULT CALLBACK Proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        switch (msg)
+        {
+        case WM_CREATE:
+        {
+            UINT dpi = GetDpiForWindow(dlg);
+            auto S = [dpi](int v){ return MulDiv(v, dpi, 96); };
+            g_font = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HINSTANCE hi = ((LPCREATESTRUCT)lParam)->hInstance;
+            struct { const wchar_t* cls; const wchar_t* txt; DWORD style; int id; int x,y,w,h; } ctl[] = {
+                { L"STATIC", L"\uB300\uC0C1 IP:",       WS_VISIBLE|WS_CHILD|SS_LEFT,                 0,           15, 18, 70, 20 },
+                { L"EDIT",   L"",                        WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, IDC_IP,    90, 15, 235, 24 },
+                { L"STATIC", L"\uD3EC\uD2B8:",           WS_VISIBLE|WS_CHILD|SS_LEFT,                 0,           15, 52, 70, 20 },
+                { L"EDIT",   L"",                        WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL|ES_NUMBER, IDC_PORT, 90, 49, 90, 24 },
+                { L"STATIC", L"Ping \uC0C1\uD0DC:",      WS_VISIBLE|WS_CHILD|SS_LEFT,                 0,           15, 88, 70, 20 },
+                { L"STATIC", L"\uCE21\uC815 \uC911...",  WS_VISIBLE|WS_CHILD|SS_LEFT,                 IDC_PINGTXT, 90, 88, 235, 20 },
+                { L"BUTTON", L"\uC9C0\uAE08 \uD655\uC778", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,         IDB_PINGNOW, 90, 116, 110, 28 },
+                { L"BUTTON", L"\uC800\uC7A5",            WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,        IDOK,       135, 162, 90, 30 },
+                { L"BUTTON", L"\uB2EB\uAE30",            WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,           IDCANCEL,   235, 162, 90, 30 },
+            };
+            for (auto& c : ctl)
+            {
+                HWND h = CreateWindowExW(0, c.cls, c.txt, c.style,
+                                         S(c.x), S(c.y), S(c.w), S(c.h),
+                                         dlg, (HMENU)(intptr_t)c.id, hi, nullptr);
+                SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+            }
+            char portbuf[16];
+            _itoa_s(g_kvmPort, portbuf, 10);
+            SetDlgItemTextA(dlg, IDC_IP, g_kvmTarget);
+            SetDlgItemTextA(dlg, IDC_PORT, portbuf);
+            SetTimer(dlg, 1, 400, nullptr);
+            return 0;
+        }
+        case WM_TIMER:
+        {
+            wchar_t s[64]; PingStatus(s, 64, nullptr);
+            SetDlgItemTextW(dlg, IDC_PINGTXT, s);
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC:
+            if ((HWND)lParam == GetDlgItem(dlg, IDC_PINGTXT))
+            {
+                COLORREF col; wchar_t s[64]; PingStatus(s, 64, &col);
+                SetBkMode((HDC)wParam, TRANSPARENT);
+                SetTextColor((HDC)wParam, col);
+                return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            }
+            break;
+        case WM_COMMAND:
+            switch (LOWORD(wParam))
+            {
+            case IDB_PINGNOW: Apply(dlg); return 0;                 // re-target + measure now
+            case IDOK:        if (Apply(dlg)) g_done = true; return 0;
+            case IDCANCEL:    g_done = true; return 0;
+            }
+            break;
+        case WM_CLOSE:
+            g_done = true;
+            return 0;
+        case WM_DESTROY:
+            KillTimer(dlg, 1);
+            if (g_font) { DeleteObject(g_font); g_font = nullptr; }
+            return 0;
+        }
+        return DefWindowProcW(dlg, msg, wParam, lParam);
+    }
+} // namespace optdlg
+
+// Modal KVM options dialog (programmatic, no .rc resource needed).
+void ShowKvmOptions(HWND owner)
+{
+    static bool registered = false;
+    HINSTANCE hi = GetModuleHandle(nullptr);
+    if (!registered)
+    {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc   = optdlg::Proc;
+        wc.hInstance     = hi;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DeckLinkKvmOptions";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    UINT dpi = GetDpiForWindow(owner);
+    int W = MulDiv(360, dpi, 96), H = MulDiv(250, dpi, 96);
+    RECT o; GetWindowRect(owner, &o);
+    int x = o.left + ((o.right - o.left) - W) / 2;
+    int y = o.top  + ((o.bottom - o.top) - H) / 2;
+
+    optdlg::g_done = false;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"DeckLinkKvmOptions",
+                               L"KVM \uC124\uC815",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               x, y, W, H, owner, nullptr, hi, nullptr);
+    if (!dlg) return;
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    MSG m;
+    while (!optdlg::g_done)
+    {
+        BOOL r = GetMessage(&m, nullptr, 0, 0);
+        if (r == 0) { PostQuitMessage((int)m.wParam); break; }  // re-post WM_QUIT to outer loop
+        if (r == -1) break;
+        if (!IsDialogMessage(dlg, &m)) { TranslateMessage(&m); DispatchMessage(&m); }
+    }
+
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+}
+
+// Title-bar right-click menu command IDs.
+enum { IDM_OPTIONS = 201, IDM_FULLSCREEN = 202, IDM_EXIT = 203 };
+
+// Runs kvm-drop.ps1 (passed as a full command line) and waits for it, updating
+// the title-bar status. Takes ownership of the heap-allocated command line.
+DWORD WINAPI DropWorker(LPVOID param)
+{
+    wchar_t* cmdline = (wchar_t*)param;
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        WaitForSingleObject(pi.hProcess, 600000);   // large files can take a while
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (code == 0) wcscpy_s(g_drop, L"\uD0C0\uAC9F \uBC14\uD0D5\uD654\uBA74 \uC804\uC1A1 \uC644\uB8CC");        // "sent to target Desktop"
+        else           wcscpy_s(g_drop, L"\uC804\uC1A1 \uC2E4\uD328 (\uC6A9\uB7C9 \uCD08\uACFC?)");  // "send failed (too big?)"
+    }
+    else
+    {
+        wcscpy_s(g_drop, L"\uC804\uC1A1 \uC2E4\uD328");  // "send failed"
+    }
+    g_dropExpire = GetTickCount64() + 6000;
+    free(cmdline);
+    return 0;
+}
+
+// Reverse drag-out: tell the target agent to stage the dragged file, then pull
+// it to PC1's Desktop. Runs on a worker thread so it can pace the HID sequence.
+DWORD WINAPI GrabWorker(LPVOID)
+{
+    const uint8_t kbUp[8]   = {0x01,0,0,0,0,0,0,0};
+    const uint8_t escDown[8]= {0x01,0,0x29,0,0,0,0,0};                 // ESC
+    const uint8_t mUp[7]    = {0x02,0x00,0x00,0x40,0x00,0x40,0x00};    // all buttons up
+    const uint8_t hkDown[8] = {0x01,0x07,0x42,0,0,0,0,0};             // Ctrl+Alt+Shift+F9
+
+    Sleep(50);
+    KvmSend(escDown, 8); Sleep(40); KvmSend(kbUp, 8); Sleep(150);     // cancel the drag
+    KvmSend(mUp, 7);     Sleep(60);                                   // release the button
+    KvmSend(hkDown, 8);  Sleep(60); KvmSend(kbUp, 8); Sleep(700);     // signal the agent
+
+    wchar_t exeDir[MAX_PATH];
+    GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
+    if (wchar_t* s = wcsrchr(exeDir, L'\\')) *s = 0;
+    std::wstring cmd = L"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \"";
+    cmd += exeDir; cmd += L"\\kvm-grab.ps1\"";
+    wchar_t* cl = _wcsdup(cmd.c_str());
+    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cl, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        WaitForSingleObject(pi.hProcess, 120000);
+        DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        if (code == 0) wcscpy_s(g_drop, L"\uD0C0\uAC9F\uC5D0\uC11C \uAC00\uC838\uC634 -> \uBC14\uD0D5\uD654\uBA74");
+        else           wcscpy_s(g_drop, L"\uAC00\uC838\uC624\uAE30 \uC2E4\uD328 (\uC120\uD0DD\uB41C \ud30c\uc77c \uc5c6\uc74c?)");
+    }
+    else wcscpy_s(g_drop, L"\uAC00\uC838\uC624\uAE30 \uC2E4\uD328");
+    g_dropExpire = GetTickCount64() + 6000;
+    free(cl);
+    return 0;
+}
+
+void StartReverseGrab(HWND hwnd)
+{
+    // Stop controlling locally WITHOUT sending releases (the worker sends ESC +
+    // button-up itself, in the right order, so the target drag is cancelled, not
+    // dropped somewhere).
+    g_capture = false;
+    g_mods = 0; g_btns = 0;
+    for (int i = 0; i < 6; ++i) g_keys[i] = 0;
+    if (GetCapture() == hwnd) ReleaseCapture();
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    wcscpy_s(g_drop, L"\uD0C0\uAC9F\uC5D0\uC11C \uAC00\uC838\uC624\uB294 \uC911...");
+    g_dropExpire = GetTickCount64() + 120000;
+    HANDLE th = CreateThread(nullptr, 0, GrabWorker, nullptr, 0, nullptr);
+    if (th) CloseHandle(th);
+    printf("KVM reverse grab triggered\n"); fflush(stdout);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
     case WM_ERASEBKGND:
         return 1;
+    case WM_DROPFILES:
+    {
+        // Files dropped onto the preview -> copy them to the target PC's Desktop
+        // (via the board's USB drive, then a KVM-triggered go.bat).
+        HDROP hDrop = (HDROP)wParam;
+        UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+        if (count > 0)
+        {
+            wchar_t exeDir[MAX_PATH];
+            GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
+            if (wchar_t* s = wcsrchr(exeDir, L'\\')) *s = 0;
+
+            std::wstring cmd = L"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \"";
+            cmd += exeDir; cmd += L"\\kvm-drop.ps1\"";
+            for (UINT i = 0; i < count; ++i)
+            {
+                wchar_t f[MAX_PATH];
+                if (DragQueryFileW(hDrop, i, f, MAX_PATH)) { cmd += L" \""; cmd += f; cmd += L"\""; }
+            }
+            wchar_t* cmdline = _wcsdup(cmd.c_str());
+            swprintf_s(g_drop, L"%u\uAC1C \uD30C\uC77C \uC804\uC1A1 \uC911...", count);  // "sending N file(s)..."
+            g_dropExpire = GetTickCount64() + 90000;
+            HANDLE th = CreateThread(nullptr, 0, DropWorker, cmdline, 0, nullptr);
+            if (th) CloseHandle(th); else { free(cmdline); g_dropExpire = 0; }
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
     case WM_PAINT:
     {
         PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps);
@@ -497,11 +841,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         unsigned long long now = g_frameCount.load();
         unsigned long long fps = now - last;
         last = now;
-        wchar_t title[384];
-        swprintf_s(title, L"DeckLink Live Preview  -  %ls  %ldx%ld  ~%llu fps   [KVM %ls -> %hs]   %ls",
+        int pms = g_pingMs.load();
+        wchar_t ping[24];
+        if (pms == -2)      wcscpy_s(ping, L"...");
+        else if (pms < 0)   wcscpy_s(ping, L"x");
+        else                swprintf_s(ping, L"%dms", pms);
+        wchar_t title[420];
+        swprintf_s(title, L"DeckLink Live Preview  -  %ls  %ldx%ld  ~%llu fps   [KVM %ls -> %hs  ping %ls]   %ls",
                    g_modeName, g_modeW, g_modeH, fps,
-                   g_capture ? L"CONTROLLING" : L"off", g_kvmTarget,
-                   g_capture ? L"(leave window to release)" : L"(double-click to control)");
+                   g_capture ? L"CONTROLLING" : L"off", g_kvmTarget, ping,
+                   g_capture ? L"(leave window to release)" : L"(right-click title bar for options)");
+        if (GetTickCount64() < g_dropExpire && g_drop[0])
+        {
+            wcscat_s(title, L"   << ");
+            wcscat_s(title, g_drop);
+            wcscat_s(title, L" >>");
+        }
         SetWindowTextW(hwnd, title);
         return 0;
     }
@@ -527,9 +882,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         EndCapture(hwnd);    // leaving the window releases control immediately
         return 0;
     case WM_LBUTTONDBLCLK:
-        // Double-click inside the preview enters remote-control mode.
+        // Outside control: double-click in the preview enters remote-control mode.
+        // While controlling, CS_DBLCLKS delivers the 2nd press of a double-click
+        // as WM_LBUTTONDBLCLK (not WM_LBUTTONDOWN), so it must be forwarded as a
+        // button-down (fall through) or the target never sees the double-click.
         if (!g_capture) { BeginCapture(hwnd); return 0; }
-        return 0;
+        // fall through
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDBLCLK:
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
     case WM_MBUTTONDOWN: case WM_MBUTTONUP:
@@ -539,13 +899,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_capture)
         {
             uint16_t x, y;
-            if (MapMouse(hwnd, mx, my, &x, &y)) { g_lastX = x; g_lastY = y; }
+            const bool overVideo = MapMouse(hwnd, mx, my, &x, &y);
+            // Drag-out gesture: left button released while dragging a file off the
+            // target screen -> grab that file from the target onto PC1's Desktop.
+            if (msg == WM_LBUTTONUP && (g_btns & 0x01) && !overVideo)
+            {
+                StartReverseGrab(hwnd);
+                return 0;
+            }
+            if (overVideo) { g_lastX = x; g_lastY = y; }
             switch (msg)
             {
+            case WM_LBUTTONDBLCLK:
             case WM_LBUTTONDOWN: g_btns |= 0x01; SetCapture(hwnd); break;
             case WM_LBUTTONUP:   g_btns &= ~0x01; break;
+            case WM_RBUTTONDBLCLK:
             case WM_RBUTTONDOWN: g_btns |= 0x02; SetCapture(hwnd); break;
             case WM_RBUTTONUP:   g_btns &= ~0x02; break;
+            case WM_MBUTTONDBLCLK:
             case WM_MBUTTONDOWN: g_btns |= 0x04; SetCapture(hwnd); break;
             case WM_MBUTTONUP:   g_btns &= ~0x04; break;
             }
@@ -575,10 +946,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             ToggleScreen(hwnd);
         }
+        else if (wParam == 'O')
+        {
+            ShowKvmOptions(hwnd);   // KVM IP / ping options
+        }
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
         if (g_capture) { ForwardKey(wParam, lParam, false); return 0; }
         return 0;
+    case WM_NCRBUTTONUP:
+        // Right-click on the title bar -> our own options menu (replaces the
+        // default system menu).
+        if (wParam == HTCAPTION)
+        {
+            SetForegroundWindow(hwnd);
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING,    IDM_OPTIONS,    L"KVM \uC124\uC815 / Ping...");
+            AppendMenuW(m, MF_SEPARATOR, 0,              nullptr);
+            AppendMenuW(m, MF_STRING,    IDM_FULLSCREEN, L"\uC804\uCCB4\uD654\uBA74 \uC804\uD658");
+            AppendMenuW(m, MF_STRING,    IDM_EXIT,       L"\uC885\uB8CC");
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                     GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), 0, hwnd, nullptr);
+            DestroyMenu(m);
+            if      (cmd == IDM_OPTIONS)    ShowKvmOptions(hwnd);
+            else if (cmd == IDM_FULLSCREEN) ToggleScreen(hwnd);
+            else if (cmd == IDM_EXIT)       PostMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -593,11 +988,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int main(int argc, char** argv)
 {
+    InitializeCriticalSection(&g_kvmLock);
+
     // Optional args: KVM target IP and UDP port (defaults: 192.168.0.8 50000).
     if (argc >= 2) { strncpy_s(g_kvmTarget, argv[1], _TRUNCATE); }
     if (argc >= 3) { g_kvmPort = atoi(argv[2]); }
     if (KvmInit()) printf("KVM: forwarding input to %s:%d (double-click window to control, leave to release)\n", g_kvmTarget, g_kvmPort);
     else           Log("KVM: UDP socket init failed (input forwarding disabled)");
+
+    // Start the background ping monitor for the KVM target.
+    g_pingRun.store(true);
+    g_pingThread = CreateThread(nullptr, 0, PingThreadProc, nullptr, 0, nullptr);
 
     // Per-monitor DPI awareness: 1920x1080 client maps 1:1 to physical pixels on
     // a 4K display (no OS bitmap stretching).
@@ -678,6 +1079,12 @@ int main(int argc, char** argv)
             SetWindowPos(g_hwnd, nullptr, 0, 0, cr.right - cr.left, cr.bottom - cr.top,
                          SWP_NOMOVE | SWP_NOZORDER);
         }
+
+        // Accept files dropped from Explorer onto the preview -> send to target.
+        DragAcceptFiles(g_hwnd, TRUE);
+        ChangeWindowMessageFilterEx(g_hwnd, WM_DROPFILES,  MSGFLT_ALLOW, nullptr);
+        ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA,   MSGFLT_ALLOW, nullptr);
+        ChangeWindowMessageFilterEx(g_hwnd, 0x0049 /*WM_COPYGLOBALDATA*/, MSGFLT_ALLOW, nullptr);
     }
 
     if (!SetupOpenGL(g_hwnd)) { Log("OpenGL setup failed"); goto cleanup; }
@@ -723,8 +1130,16 @@ cleanup:
     if (g_input)  g_input->Release();
     if (deckLink) deckLink->Release();
     if (iterator) iterator->Release();
+    if (g_pingThread)
+    {
+        g_pingRun.store(false);
+        WaitForSingleObject(g_pingThread, 1500);
+        CloseHandle(g_pingThread);
+        g_pingThread = nullptr;
+    }
     if (g_sock != INVALID_SOCKET) closesocket(g_sock);
     WSACleanup();
+    DeleteCriticalSection(&g_kvmLock);
     CoUninitialize();
     return exitCode;
 }

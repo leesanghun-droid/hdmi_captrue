@@ -24,6 +24,72 @@ because it applies scaling/filtering that softens text.
 | `F` / `F11`| Toggle fullscreen (sharpest 1:1)|
 | `ESC`      | Exit (or leave fullscreen)      |
 
+Right-click the title bar for options (KVM target IP, ping status, etc.).
+
+## KVM control (keyboard / video / mouse over IP)
+
+The preview can also drive the captured machine ("target") as a KVM. A small
+USB-gadget board (RK3568 / Firefly) plugged into the target presents itself as a
+USB keyboard + mouse + mass-storage device. The preview app sends keyboard and
+mouse events as UDP packets to a HID daemon (`board/kvm_hid.py`) on the board,
+which replays them onto the target.
+
+- **Enter control:** double-click the preview. The cursor is hidden and all
+  input is forwarded to the target.
+- **Leave control:** move the mouse out of the window (when not dragging).
+- Mouse uses absolute positioning pinned to a 1920x1080 target; double-clicks
+  are forwarded.
+
+## File transfer (both directions, drag-and-drop)
+
+A FAT32 disk image on the board is exposed to the target as a removable USB
+drive (`KVMSHARE`). A tiny resident **agent** on the target
+(`agent/agent.ps1`, installed once via `agent/install.bat`) moves files between
+that drive and the desktop silently — no console windows, Run dialogs, or
+folder pop-ups.
+
+### PC1 → Target (drop onto the preview)
+
+Drag files from Explorer **onto the preview window**. They are staged into the
+USB drive's `_drop` folder; the target agent copies them onto the target's
+Desktop. The title bar shows transfer progress.
+
+Flow: `main.cpp` (`WM_DROPFILES`) → `kvm-drop.ps1` → `scp` to board inbox →
+`board/kvm-drop.sh` (→ `D:\_drop`) → target agent → target Desktop.
+
+### Target → PC1 (drag a file off the screen)
+
+While in KVM control, **grab a file on the target, drag it past the edge of the
+preview, and release outside the video.** That gesture transfers the dragged
+file to PC1's Desktop. Because PC1 detects the gesture itself, there is no idle
+polling — the USB drive blips exactly once, only when you actually do it.
+
+Flow: `main.cpp` detects "button-up outside the video while dragging" →
+`GrabWorker` sends **ESC** (cancels the target drag so the file stays selected),
+releases the button, then a dedicated grab hotkey (`Ctrl+Alt+Shift+F9`) → the
+target agent captures the selected file (Explorer selection via Shell COM, or
+clipboard `Ctrl+C` fallback for the Desktop) and writes it to `_pull` →
+`kvm-grab.ps1` pulls it (`board/kvm-share.sh reverse` → `revout` → `scp`) onto
+PC1's Desktop.
+
+## Components
+
+| Path                  | Runs on | Purpose                                                        |
+| --------------------- | ------- | -------------------------------------------------------------- |
+| `main.cpp`            | PC1     | Preview + KVM input + drop/drag-out gesture detection          |
+| `kvm-drop.ps1`        | PC1     | Stage dropped files onto the board, trigger the target agent   |
+| `kvm-grab.ps1`        | PC1     | Reverse pull: fetch the file the target agent staged           |
+| `kvm-push/pull/sync.ps1` | PC1  | Manual helpers for the shared USB drive                        |
+| `board/kvm_hid.py`    | board   | USB HID daemon (replays KVM input) + mass-storage gadget       |
+| `board/kvm-share.sh`  | board   | Mount/sync the disk image; `reverse` stages `_pull` → `revout` |
+| `board/kvm-drop.sh`   | board   | Stage inbox files into the drive's `_drop` (size/space checks) |
+| `board/deploy.sh`     | board   | One-time board setup (gadget, 8 GB FAT32 image, service)       |
+| `agent/agent.ps1`     | target  | Silent resident agent: `_drop` → Desktop, grab hotkey → `_pull`|
+| `agent/install.bat`   | target  | Installs the agent to `%APPDATA%`, autostart at logon          |
+
+The board scripts always re-arm the USB gadget on exit (`trap cleanup EXIT`), so
+a failed transfer never leaves KVM dead.
+
 ## Requirements
 
 - Windows 10/11 (x64)

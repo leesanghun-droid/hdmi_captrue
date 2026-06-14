@@ -265,6 +265,23 @@ def main():
     args = parser.parse_args()
     function_list = [HIDConfigFunction]
     if with_msc:
+        # On this RK3568 5.10 kernel a *file*-backed mass_storage LUN reports a
+        # zero / unknown capacity to the host ("cannot determine the number of
+        # sectors"), so Windows assigns a drive letter but cannot read/format it.
+        # Backing the LUN with a loop *block device* makes the kernel report the
+        # correct capacity. Detach any stale loop for the image first, then
+        # attach a fresh one and use it as the backing store.
+        import subprocess
+        subprocess.run(
+            'losetup -j %s 2>/dev/null | cut -d: -f1 | xargs -r losetup -d'
+            % IMG_PATH,
+            shell=True,
+        )
+        msc_backing = subprocess.check_output(
+            ['losetup', '--find', '--show', IMG_PATH]
+        ).decode().strip()
+        sys.stderr.write('kvm_hid: mass_storage backing = %s\n' % msc_backing)
+        sys.stderr.flush()
         # NOTE: order matters. 'removable'/'ro' can only be changed while no
         # backing file is open, so 'file' MUST be written last.
         msc = functools.partial(
@@ -272,7 +289,7 @@ def main():
             config_dict={
                 'lun.0/removable': '1',
                 'lun.0/ro': '0',
-                'lun.0/file': IMG_PATH,
+                'lun.0/file': msc_backing,
             },
         )
         if msc_first:
@@ -297,7 +314,7 @@ def main():
         bcdDevice=0x0100,
         lang_dict={
             0x409: {
-                'serialnumber': 'rk3568-kvm-0001',
+                'serialnumber': 'rk3568-kvm-0002',
                 'product': 'RK3568 KVM',
                 'manufacturer': 'DIY',
             },

@@ -14,3 +14,6 @@ DeckLinkAPI_i.c
 *.log
 *.err
 *.png
+
+# Runtime file-share staging (local user data, not source)
+share/
